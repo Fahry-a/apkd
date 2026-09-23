@@ -21,7 +21,9 @@ CASES = {
 
 class LiveProviderTests(unittest.TestCase):
     def test_each_provider_resolves_and_downloads(self):
-        for name, (provider_cls, package, version) in CASES.items():
+        selected = os.getenv("APKD_PROVIDER")
+        cases = {selected: CASES[selected]} if selected in CASES else CASES
+        for name, (provider_cls, package, version) in cases.items():
             with self.subTest(provider=name):
                 provider = provider_cls()
                 artifact = provider.resolve(package, version)
