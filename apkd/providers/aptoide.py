@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from urllib.parse import urlencode
-
 from .base import Provider
 from ..models import Artifact, ProviderError
 
