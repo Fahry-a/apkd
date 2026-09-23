@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import re
 from urllib.parse import quote, urljoin
 
@@ -55,8 +54,9 @@ class UptodownProvider(Provider):
         soup = BeautifulSoup(response.text, "html.parser")
         for link in soup.select("a[href]"):
             href = link.get("href", "")
-            if ".uptodown.com/android/" in href and "/search/" not in href:
-                return href.rstrip("/")
+            absolute = urljoin(response.url, href)
+            if ".uptodown.com/android/" in absolute and "/search/" not in absolute:
+                return absolute.rstrip("/")
         # Some locales expose the search page under a locale-specific host.
         for locale in self.locales[1:]:
             response = self.http.get(
@@ -65,8 +65,9 @@ class UptodownProvider(Provider):
             soup = BeautifulSoup(response.text, "html.parser")
             for link in soup.select("a[href]"):
                 href = link.get("href", "")
-                if ".uptodown.com/android/" in href and "/search/" not in href:
-                    return href.rstrip("/")
+                absolute = urljoin(response.url, href)
+                if ".uptodown.com/android/" in absolute and "/search/" not in absolute:
+                    return absolute.rstrip("/")
         raise ProviderError(f"Uptodown app not found for package {package}")
 
     def _latest_version(self, soup: BeautifulSoup) -> str:
