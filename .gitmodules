@@ -1,0 +1,6 @@
+[submodule "apkpure-downloader"]
+	path = apkpure-downloader
+	url = https://github.com/codewithwan/apkpure-downloader.git
+[submodule "apkmirror-downloader"]
+	path = apkmirror-downloader
+	url = https://github.com/tanishqmanuja/apkmirror-downloader.git
