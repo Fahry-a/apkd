@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: true
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -e .
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+
+  live-providers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        provider: [uptodown, apkcombo, aptoide]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          submodules: true
+      - uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -e .
+      - name: Live provider test
+        env:
+          APKD_PROVIDER: ${{ matrix.provider }}
+          # Pinning these to known-good versions avoids turning a moving
+          # provider catalog into a false failure. Leave blank to test latest.
+          APKD_UPTODOWN_PACKAGE: com.google.android.apps.photos
+          APKD_APKCOMBO_PACKAGE: com.google.android.apps.photos
+          APKD_APTOIDE_PACKAGE: com.google.android.apps.photos
+        run: |
+          python -m unittest tests.test_live_providers.LiveProviderTests.test_each_provider_resolves_and_downloads -v
