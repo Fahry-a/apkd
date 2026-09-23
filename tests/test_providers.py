@@ -10,12 +10,14 @@ class ProviderUnitTests(unittest.TestCase):
         provider = AptoideProvider()
         data = {
             "datalist": {"list": [
-                {"package": "wrong.package", "file": {"vername": "1"}},
-                {"package": "com.example.app", "file": {"vername": "2"}},
+                {"package": "wrong.package", "file": {"vername": "1", "path": "https://example.invalid/wrong.apk"}},
+                {"package": "com.example.app", "file": {"vername": "2", "path": "https://example.invalid/app.apk"}},
             ]}
         }
         provider._get_json = lambda path, params: data
-        self.assertEqual(provider.resolve("com.example.app").version, "2")
+        artifact = provider.resolve("com.example.app")
+        self.assertEqual(artifact.version, "2")
+        self.assertEqual(artifact.url, "https://example.invalid/app.apk")
 
     def test_apkcombo_version_normalization(self):
         self.assertTrue(APKComboProvider._same_version("1.2.3 (123)", "1.2.3"))
@@ -23,6 +25,7 @@ class ProviderUnitTests(unittest.TestCase):
 
     def test_uptodown_version_normalization(self):
         self.assertEqual(UptodownProvider._normalize("7.90 [123]"), "7.90")
+        self.assertEqual(UptodownProvider._normalize("v7.90"), "7.90")
 
 
 if __name__ == "__main__":
