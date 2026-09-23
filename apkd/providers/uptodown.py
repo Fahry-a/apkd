@@ -104,12 +104,12 @@ class UptodownProvider(Provider):
     @staticmethod
     def _extension(soup: BeautifulSoup) -> str:
         text = soup.get_text(" ", strip=True).lower()
-        match = re.search(r"file type\\s+(apk|xapk|apkm|apks)", text)
+        match = re.search(r"file type\s+(apk|xapk|apkm|apks)", text)
         if match:
             return "." + match.group(1)
         return ".apk"
 
     @staticmethod
     def _normalize(value: str) -> str:
-        value = re.sub(r"[\\[\\(].*?[\\]\\)]", "", value)
+        value = re.sub(r"[\[\(].*?[\]\)]", "", value)
         return re.sub(r"^v", "", value.strip(), flags=re.IGNORECASE)
