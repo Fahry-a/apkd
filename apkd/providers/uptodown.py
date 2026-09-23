@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, unquote, urljoin
 
 from bs4 import BeautifulSoup
 
@@ -11,122 +11,105 @@ from ..models import Artifact, ProviderError
 
 class UptodownProvider(Provider):
     name = "uptodown"
-    locales = ("en", "in", "de", "fr", "it", "ru", "jp", "kr")
 
     def resolve(self, package: str, version: str | None = None, arch: str | None = None) -> Artifact:
         app_url = self._find_app(package)
-        versions_url = app_url.rstrip("/") + "/versions"
-        page = self.http.get(versions_url)
-        soup = BeautifulSoup(page.text, "html.parser")
-        heading = soup.select_one("#detail-app-name")
-        if not heading:
-            raise ProviderError("Uptodown app page has no application metadata")
-        data_code = heading.get("data-code")
-        if not data_code:
-            raise ProviderError("Uptodown app page has no data-code")
-
         if version is None:
-            version = self._latest_version(soup)
-        entry = self._find_version(app_url, data_code, version)
-        parts = entry.get("versionURL") or {}
-        version_url = "/".join(str(parts.get(k, "")).strip("/") for k in ("url", "extraURL", "versionID"))
-        if not version_url.startswith("http"):
-            raise ProviderError(f"Uptodown returned an invalid version URL for {version}")
+            page = self.http.get(app_url)
+            soup = BeautifulSoup(page.text, "html.parser")
+            version = self._page_version(soup)
+        else:
+            page = self._find_version_page(app_url, version)
+            soup = BeautifulSoup(page.text, "html.parser")
 
-        version_page = self.http.get(version_url)
-        vsoup = BeautifulSoup(version_page.text, "html.parser")
-        file_id = self._pick_variant(app_url, data_code, parts.get("versionID"), vsoup, arch)
-        if file_id:
-            variant_page = self.http.get(f"{app_url.rstrip('/')}/download/{file_id}-x")
-            vsoup = BeautifulSoup(variant_page.text, "html.parser")
-
-        button = vsoup.select_one("#detail-download-button")
-        if not button or not button.get("data-url"):
-            raise ProviderError(f"Uptodown did not expose a direct download URL for {version}")
-        token = button["data-url"]
-        url = urljoin("https://dw.uptodown.com/dwn/", token)
-        extension = ".xapk" if str(entry.get("kindFile", "")).lower() == "xapk" else ".apk"
-        return Artifact(self.name, package, version, url, extension, arch)
+        download_url = self._download_url(app_url, page.url, soup)
+        extension = self._extension(soup)
+        return Artifact(self.name, package, version, download_url, extension, arch)
 
     def _find_app(self, package: str) -> str:
-        search_url = f"https://en.uptodown.com/android/search/{quote(package, safe='')}"
-        response = self.http.get(search_url)
+        # Uptodown changed /android/search/<package> to a POST search endpoint.
+        response = self.http.post(
+            "https://en.uptodown.com/android/search",
+            data={"singlebutton": "", "q": package},
+            headers={"Referer": "https://en.uptodown.com/"},
+        )
         soup = BeautifulSoup(response.text, "html.parser")
         for link in soup.select("a[href]"):
             href = link.get("href", "")
             absolute = urljoin(response.url, href)
-            if ".uptodown.com/android/" in absolute and "/search/" not in absolute:
+            if ".uptodown.com/android/" in absolute and "/search" not in absolute:
                 return absolute.rstrip("/")
-        # Some locales expose the search page under a locale-specific host.
-        for locale in self.locales[1:]:
-            response = self.http.get(
-                f"https://{locale}.uptodown.com/android/search/{quote(package, safe='')}"
-            )
-            soup = BeautifulSoup(response.text, "html.parser")
-            for link in soup.select("a[href]"):
-                href = link.get("href", "")
-                absolute = urljoin(response.url, href)
-                if ".uptodown.com/android/" in absolute and "/search/" not in absolute:
-                    return absolute.rstrip("/")
+
         raise ProviderError(f"Uptodown app not found for package {package}")
 
-    def _latest_version(self, soup: BeautifulSoup) -> str:
-        node = soup.select_one("[itemprop='softwareVersion'], .version")
+    def _find_version_page(self, app_url: str, version: str):
+        versions = self.http.get(app_url.rstrip("/") + "/versions")
+        soup = BeautifulSoup(versions.text, "html.parser")
+        target = self._normalize(version)
+
+        for link in soup.select("a[href]"):
+            text = link.get_text(" ", strip=True)
+            version_node = link.select_one(".app_card_version")
+            candidates = [text]
+            if version_node:
+                candidates.append(version_node.get_text(" ", strip=True))
+            if any(self._normalize(value) == target for value in candidates if value):
+                href = link.get("href")
+                if href:
+                    return self.http.get(urljoin(versions.url, href))
+
+        # The versions page can expose a version directly in a data attribute.
+        for node in soup.select("[data-version][href], a[data-version]"):
+            if self._normalize(node.get("data-version", "")) == target:
+                href = node.get("href")
+                if href:
+                    return self.http.get(urljoin(versions.url, href))
+
+        raise ProviderError(f"Uptodown version not found: {version}")
+
+    def _download_url(self, app_url: str, page_url: str, soup: BeautifulSoup) -> str:
+        button = soup.select_one("#detail-download-button[data-url]")
+        if button:
+            return "https://dw.uptodown.com/dwn/" + button["data-url"].lstrip("/")
+
+        heading = soup.select_one("#detail-app-name[data-file-id]")
+        if not heading:
+            raise ProviderError("Uptodown download page has no file id")
+
+        file_id = heading["data-file-id"]
+        download_page = self.http.get(f"{app_url.rstrip('/')}/download/{file_id}-x")
+        download_soup = BeautifulSoup(download_page.text, "html.parser")
+        button = download_soup.select_one("#detail-download-button[data-url]")
+        if button:
+            return "https://dw.uptodown.com/dwn/" + button["data-url"].lstrip("/")
+
+        post_download = self.http.get(f"{app_url.rstrip('/')}/post-download/{file_id}")
+        post_soup = BeautifulSoup(post_download.text, "html.parser")
+        node = post_soup.select_one("[data-url]")
+        if node and node.get("data-url"):
+            return "https://dw.uptodown.com/dwn/" + node["data-url"].lstrip("/")
+
+        raise ProviderError(f"Uptodown did not expose a direct download URL for {page_url}")
+
+    @staticmethod
+    def _page_version(soup: BeautifulSoup) -> str:
+        node = soup.select_one("[itemprop='softwareVersion'], .version, div.version")
         if not node:
             raise ProviderError("Uptodown did not expose a version")
         value = node.get_text(" ", strip=True)
         if not value:
             raise ProviderError("Uptodown returned an empty version")
-        return value
+        return value.lstrip("v").strip()
 
-    def _find_version(self, app_url: str, data_code: str, version: str) -> dict:
-        target = self._normalize(version)
-        for page_number in range(1, 21):
-            response = self.http.get(
-                f"{app_url.rstrip('/')}/apps/{data_code}/versions/{page_number}"
-            )
-            payload = response.json()
-            entries = payload.get("data") or []
-            if not entries:
-                break
-            for entry in entries:
-                if self._normalize(str(entry.get("version", ""))) == target:
-                    return entry
-        raise ProviderError(f"Uptodown version not found: {version}")
-
-    def _pick_variant(self, app_url: str, data_code: str, version_id: object,
-                      version_soup: BeautifulSoup, arch: str | None) -> str | None:
-        button = version_soup.select_one(".button.variants[data-version]")
-        if not button:
-            return None
-        data_version = button.get("data-version") or version_id
-        if not data_version:
-            return None
-        files_url = f"{app_url.rsplit('/android', 1)[0]}/app/{data_code}/version/{data_version}/files"
-        response = self.http.get(files_url)
-        content = (response.json() or {}).get("content", "")
-        soup = BeautifulSoup(content, "html.parser")
-        wanted = {"arm-v7a": "armeabi-v7a", "arm32": "armeabi-v7a"}.get(arch or "", arch)
-        current_arch = ""
-        fallback = None
-        for child in soup.select(".content > *"):
-            if child.name == "p":
-                current_arch = child.get_text(" ", strip=True).lower()
-                continue
-            if "variant" not in (child.get("class") or []):
-                continue
-            report = child.select_one(".v-report[data-file-id]")
-            if not report:
-                continue
-            file_id = report.get("data-file-id")
-            if fallback is None:
-                fallback = file_id
-            if wanted and wanted in current_arch:
-                return file_id
-            if not wanted:
-                return file_id
-        return fallback
+    @staticmethod
+    def _extension(soup: BeautifulSoup) -> str:
+        text = soup.get_text(" ", strip=True).lower()
+        match = re.search(r"file type\\s+(apk|xapk|apkm|apks)", text)
+        if match:
+            return "." + match.group(1)
+        return ".apk"
 
     @staticmethod
     def _normalize(value: str) -> str:
-        return re.sub(r"[\[\(].*?[\]\)]", "", value).strip()
+        value = re.sub(r"[\\[\\(].*?[\\]\\)]", "", value)
+        return re.sub(r"^v", "", value.strip(), flags=re.IGNORECASE)
