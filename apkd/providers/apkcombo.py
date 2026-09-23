@@ -137,5 +137,8 @@ class APKComboProvider(Provider):
     def _same_version(left: str | None, right: str | None) -> bool:
         if not left or not right:
             return False
-        clean = lambda value: re.sub(r"[^a-z0-9.]+", "", value.lower())
+        def clean(value: str) -> str:
+            value = re.sub(r"[\\[\\(].*?[\\]\\)]", "", value)
+            return re.sub(r"[^a-z0-9.]+", "", value.lower())
+
         return clean(left) == clean(right)
