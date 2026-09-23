@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import io
 import zipfile
 from pathlib import Path
 
 
 APK_EXTENSIONS = {".apk", ".xapk", ".apkm", ".apks"}
+
+
+def _contains_manifest(data: bytes) -> bool:
+    if not zipfile.is_zipfile(io.BytesIO(data)):
+        return False
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        return "AndroidManifest.xml" in archive.namelist()
 
 
 def validate_package(path: Path, *, expected_extension: str | None = None) -> None:
@@ -24,5 +32,11 @@ def validate_package(path: Path, *, expected_extension: str | None = None) -> No
 
     with zipfile.ZipFile(path) as archive:
         names = set(archive.namelist())
-        if "AndroidManifest.xml" not in names:
-            raise ValueError("downloaded package has no AndroidManifest.xml")
+        if suffix == ".apk":
+            if "AndroidManifest.xml" not in names:
+                raise ValueError("downloaded APK has no AndroidManifest.xml")
+            return
+
+        nested_apks = [name for name in names if name.lower().endswith(".apk")]
+        if not any(_contains_manifest(archive.read(name)) for name in nested_apks):
+            raise ValueError(f"downloaded {suffix} has no valid APK containing AndroidManifest.xml")
