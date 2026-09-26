@@ -1,12 +1,15 @@
+import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from apkd.models import Artifact, DownloadRequest, ProviderError
 from apkd.providers.apkcombo import APKComboProvider
 from apkd.providers.apkpure import APKPureProvider
 from apkd.providers.aptoide import AptoideProvider
-from apkd.providers.uptodown import UptodownProvider
+from apkd.providers.uptodown import UptodownProvider, UptodownTarget
 
 
 class _StubClient:
@@ -186,6 +189,29 @@ class ProviderUnitTests(unittest.TestCase):
             "https://apkcombo.com" + href,
         )
 
+    # Live-shaped "All variants" panel for Pinterest 14.34.0: the plain
+    # /download/{id} page serves Uptodown's store wrapper, the real artifacts
+    # are the -x variant pages (first row is the universal APK).
+    _UPTODOWN_PANEL = """
+    <section class="variants"><div class="content">
+    <p>arm64-v8a, armeabi-v7a, x86, x86_64</p>
+    <div class="variant">
+      <div class="v-version" onclick="location.href='https://pinterest.en.uptodown.com/android/download/1210795434-x';">14.34.0</div>
+      <div class="v-file"><span class="apk">apk</span></div>
+    </div>
+    <p>arm64-v8a, armeabi-v7a, x86_64</p>
+    <div class="variant">
+      <div class="v-version" onclick="location.href='https://pinterest.en.uptodown.com/android/download/1210814246-x';">14.34.0</div>
+      <div class="v-file"><span class="xapk">xapk</span></div>
+    </div>
+    <p>arm64-v8a, armeabi-v7a</p>
+    <div class="variant">
+      <div class="v-version" onclick="location.href='https://pinterest.en.uptodown.com/android/download/1213582223-x';">14.34.0</div>
+      <div class="v-file"><span class="xapk">xapk</span></div>
+    </div>
+    </div></section>
+    """
+
     def test_uptodown_resolves_exact_metadata_without_browser(self):
         class Response:
             def __init__(self, url, text="", payload=None):
@@ -232,6 +258,14 @@ class ProviderUnitTests(unittest.TestCase):
                 return Response(url, app_html)
             if "/apps/20013/versions/" in url:
                 return Response(url, payload=versions)
+            if "/download/" in url:
+                return Response(
+                    url,
+                    '<button class="button variants" '
+                    'data-version="13986103">All variants</button>',
+                )
+            if "/app/20013/version/13986103/files" in url:
+                return Response(url, payload={"content": self._UPTODOWN_PANEL})
             raise AssertionError(url)
 
         provider = UptodownProvider()
@@ -244,30 +278,45 @@ class ProviderUnitTests(unittest.TestCase):
         )
         self.assertEqual(target.file_id, "1213582223")
         self.assertEqual(target.kind, "xapk")
-        self.assertEqual(target.page_url.rsplit("/", 1)[-1], "1213582223")
+        self.assertEqual(target.page_url.rsplit("/", 1)[-1], "1213582223-x")
 
     def test_uptodown_uses_configured_app_id_without_app_page(self):
         calls = []
 
         class Response:
-            url = "https://pinterest.en.uptodown.com/android/apps/20013/versions/1"
-            text = "{}"
+            text = (
+                '<button class="button variants" '
+                'data-version="13986103">All variants</button>'
+            )
+
+            def __init__(self, url=None, payload=None):
+                self.url = (
+                    url or "https://pinterest.en.uptodown.com/android"
+                    "/apps/20013/versions/1"
+                )
+                self._payload = payload if payload is not None else {
+                    "data": [{
+                        "fileID": 1213582223,
+                        "version": "14.34.0",
+                        "kindFile": "xapk",
+                        "versionURL": {
+                            "url": "https://pinterest.en.uptodown.com/android",
+                            "extraURL": "download",
+                            "versionID": 1213582223,
+                        },
+                    }]
+                }
 
             def json(self):
-                return {"data": [{
-                    "fileID": 1213582223,
-                    "version": "14.34.0",
-                    "kindFile": "xapk",
-                    "versionURL": {
-                        "url": "https://pinterest.en.uptodown.com/android",
-                        "extraURL": "download",
-                        "versionID": 1213582223,
-                    },
-                }]}
+                return self._payload
+
+        panel = self._UPTODOWN_PANEL
 
         def get(url, **kwargs):
             del kwargs
             calls.append(url)
+            if "/app/20013/version/13986103/files" in url:
+                return Response(payload={"content": panel})
             return Response()
 
         provider = UptodownProvider()
@@ -279,10 +328,105 @@ class ProviderUnitTests(unittest.TestCase):
             )
         )
         self.assertEqual(target.app_id, "20013")
+        self.assertEqual(target.page_url.rsplit("/", 1)[-1], "1213582223-x")
         self.assertEqual(
             calls,
-            ["https://pinterest.en.uptodown.com/android/apps/20013/versions/1"],
+            ["https://pinterest.en.uptodown.com/android/apps/20013/versions/1",
+             "https://pinterest.en.uptodown.com/android/download/1213582223",
+             "https://pinterest.en.uptodown.com/app/20013/version/13986103/files"],
         )
+
+    def test_uptodown_selects_universal_apk_variant_page(self):
+        """The plain download page is the store wrapper; the -x variant is real.
+
+        Regression for the manual finding that /download/1210795434 serves
+        ``com.uptodown`` while /download/1210795434-x serves Pinterest 14.34.0
+        (universal APK: arm64-v8a, armeabi-v7a, x86, x86_64).
+        """
+        class Response:
+            def __init__(self, url, text="", payload=None):
+                self.url = url
+                self.text = text
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        versions = {"data": [{
+            "fileID": 1210795434,
+            "version": "14.34.0",
+            "kindFile": "apk",
+            "versionURL": {
+                "url": "https://pinterest.en.uptodown.com/android",
+                "extraURL": "download",
+                "versionID": 1210795434,
+            },
+        }]}
+
+        def get(url, **kwargs):
+            del kwargs
+            if "/apps/20013/versions/" in url:
+                return Response(url, payload=versions)
+            if "/download/" in url:
+                return Response(
+                    url,
+                    '<button class="button variants" '
+                    'data-version="13986103">All variants</button>',
+                )
+            if "/app/20013/version/13986103/files" in url:
+                return Response(url, payload={"content": self._UPTODOWN_PANEL})
+            raise AssertionError(url)
+
+        provider = UptodownProvider()
+        provider.http.get = get
+        target = provider.resolve_target(
+            DownloadRequest(
+                package="com.pinterest", version="14.34.0",
+                arch="universal", app_slug="pinterest", app_id="20013",
+            )
+        )
+        self.assertEqual(target.file_id, "1210795434")
+        self.assertEqual(target.kind, "apk")
+        self.assertTrue(target.page_url.endswith("/download/1210795434-x"))
+
+    def test_uptodown_keeps_plain_page_without_variants_button(self):
+        """Single-variant apps have no variants button; keep old behavior."""
+        class Response:
+            def __init__(self, url, text="", payload=None):
+                self.url = url
+                self.text = text
+                self._payload = payload or {}
+
+            def json(self):
+                return self._payload
+
+        versions = {"data": [{
+            "fileID": 999,
+            "version": "1.0",
+            "kindFile": "apk",
+            "versionURL": {
+                "url": "https://example.en.uptodown.com/android",
+                "extraURL": "download",
+                "versionID": 999,
+            },
+        }]}
+
+        def get(url, **kwargs):
+            del kwargs
+            if "/apps/1/versions/" in url:
+                return Response(url, payload=versions)
+            return Response(url, "<html>no variants button here</html>")
+
+        provider = UptodownProvider()
+        provider.http.get = get
+        target = provider.resolve_target(
+            DownloadRequest(
+                package="com.example", version="1.0",
+                arch="universal", app_slug="example", app_id="1",
+            )
+        )
+        self.assertEqual(target.file_id, "999")
+        self.assertTrue(target.page_url.endswith("/download/999"))
 
     def test_uptodown_requires_visible_browser_for_download(self):
         class Response:
@@ -344,6 +488,36 @@ class ProviderUnitTests(unittest.TestCase):
     def test_uptodown_cdp_endpoint_enables_browser_mode(self):
         provider = UptodownProvider(cdp_url="http://127.0.0.1:9222")
         self.assertTrue(provider._browser_enabled())
+
+    def test_uptodown_invisible_mode_is_opt_in(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("APKD_UPTODOWN_INVISIBLE", None)
+            os.environ.pop("APKD_UPTODOWN_SEED", None)
+            self.assertFalse(UptodownProvider()._invisible_enabled())
+            self.assertIsNone(UptodownProvider()._invisible_seed())
+        with patch.dict(os.environ, {"APKD_UPTODOWN_INVISIBLE": "1"}):
+            self.assertTrue(UptodownProvider()._invisible_enabled())
+        with patch.dict(os.environ, {"APKD_UPTODOWN_SEED": "42"}):
+            self.assertEqual(UptodownProvider()._invisible_seed(), 42)
+        with patch.dict(os.environ, {"APKD_UPTODOWN_SEED": "nope"}):
+            self.assertIsNone(UptodownProvider()._invisible_seed())
+        # Explicit constructor flags win over the environment.
+        with patch.dict(os.environ, {"APKD_UPTODOWN_INVISIBLE": "1"}):
+            self.assertFalse(UptodownProvider(invisible=False)._invisible_enabled())
+        self.assertEqual(UptodownProvider(invisible_seed=7)._invisible_seed(), 7)
+
+    def test_uptodown_invisible_mode_needs_the_package(self):
+        target = UptodownTarget(
+            app_url="https://pinterest.en.uptodown.com/android",
+            app_id="20013", version="14.34.0", file_id="1210795434",
+            kind="apk",
+            page_url="https://pinterest.en.uptodown.com/android/download/1210795434-x",
+            only_xapk="0",
+        )
+        provider = UptodownProvider(browser=True, invisible=True)
+        with patch.dict(sys.modules, {"invisible_playwright": None}):
+            with self.assertRaisesRegex(ProviderError, "invisible-playwright"):
+                provider._browser_download_url(target)
 
     def test_uptodown_headless_retry_settings_are_bounded(self):
         provider = UptodownProvider(

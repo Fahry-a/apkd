@@ -37,6 +37,13 @@ captcha = [
   "playwright>=1.49,<2",
   "patchright>=1.63,<2",
 ]
+# Stealth Firefox engine for the Uptodown browser download
+# (APKD_UPTODOWN_INVISIBLE=1). Presents a coherent fingerprint so Turnstile
+# does not reject the session outright; an interactive challenge is still
+# completed by the operator. Verified live against Pinterest 14.34.0.
+invisible = [
+  "invisible-playwright>=0.25.5,<0.26",
+]
 
 [project.scripts]
 apkd = "apkd.cli:main"

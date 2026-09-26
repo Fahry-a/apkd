@@ -9,12 +9,45 @@ import tempfile
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import quote, urljoin
+from urllib.parse import quote, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from .base import Provider, normalize_arch
+from .base import UNIVERSAL_ABIS, Provider, matches_abi, normalize_arch
 from ..models import Artifact, DownloadRequest, ProviderError
+
+
+def _parse_variants(panel_html: str) -> list[dict[str, str]]:
+    """Parse the "All variants" panel into variant descriptors.
+
+    Each ``div.variant`` inside ``section.variants`` carries the variant file
+    ID in its ``location.href='.../download/{id}-x'`` handler, the container
+    kind in ``.v-file``, and the ABI list in the preceding ``<p>``. The
+    store-promo header above the section is ignored by scoping to it.
+    """
+    soup = BeautifulSoup(panel_html or "", "html.parser")
+    section = soup.select_one("section.variants") or soup
+    variants: list[dict[str, str]] = []
+    current_abis = ""
+    for node in section.select("p, div.variant"):
+        if node.name == "p":
+            current_abis = node.get_text(" ", strip=True)
+            continue
+        onclick = (node.get("onclick") or "") + " " + " ".join(
+            (child.get("onclick") or "") for child in node.select("[onclick]")
+        )
+        match = re.search(r"/download/(\d+)-x", onclick)
+        if not match:
+            continue
+        kind_node = node.select_one(".v-file")
+        variants.append(
+            {
+                "file_id": match.group(1),
+                "kind": (kind_node.get_text(strip=True) if kind_node else "").lower(),
+                "abis": current_abis,
+            }
+        )
+    return variants
 
 
 @dataclass(frozen=True)
@@ -64,6 +97,8 @@ class UptodownProvider(Provider):
         retry_wait: float | None = None,
         max_attempts: int | None = None,
         response_timeout: float | None = None,
+        invisible: bool | None = None,
+        invisible_seed: int | None = None,
     ) -> None:
         super().__init__(http)
         self.browser = browser
@@ -75,6 +110,8 @@ class UptodownProvider(Provider):
         self.retry_wait = retry_wait
         self.max_attempts = max_attempts
         self.response_timeout = response_timeout
+        self.invisible = invisible
+        self.invisible_seed = invisible_seed
 
     def resolve_request(self, request: DownloadRequest) -> Artifact:
         target = self.resolve_target(request)
@@ -154,14 +191,83 @@ class UptodownProvider(Provider):
                 f"Uptodown returned unsupported file type {kind!r} for {package}",
                 provider=self.name,
             )
+        file_id, kind, page_url = self._select_variant(
+            request, app_url, app_id, version_url, file_id, kind,
+        )
         return UptodownTarget(
             app_url=app_url,
             app_id=app_id,
             version=str(entry.get("version") or request.version),
             file_id=file_id,
             kind=kind,
-            page_url=version_url,
+            page_url=page_url,
             only_xapk="1" if kind == "xapk" else "0",
+        )
+
+    def _select_variant(
+        self,
+        request: DownloadRequest,
+        app_url: str,
+        app_id: str,
+        version_url: str,
+        file_id: str,
+        kind: str,
+    ) -> tuple[str, str, str]:
+        """Resolve the ABI variant page for a version.
+
+        The plain ``/download/{file_id}`` page serves Uptodown's own store
+        wrapper (package ``com.uptodown``), not the app. The real artifacts
+        live behind per-variant ``/download/{file_id}-x`` pages listed in the
+        "All variants" panel (``/app/{app_id}/version/{version_id}/files``).
+        Without a variants button (single-variant apps) the plain page is
+        kept as-is.
+        """
+        fallback = (file_id, kind, version_url)
+        try:
+            page = self.http.get(version_url)
+        except Exception:
+            return fallback
+        soup = BeautifulSoup(page.text, "html.parser")
+        button = soup.select_one("button.variants[data-version]")
+        version_id = (
+            str(button.get("data-version") or "").strip() if button else ""
+        )
+        if not version_id:
+            return fallback
+        origin = f"{urlparse(app_url).scheme}://{urlparse(app_url).netloc}"
+        try:
+            response = self.http.get(
+                f"{origin}/app/{quote(app_id, safe='')}/version/"
+                f"{quote(version_id, safe='')}/files"
+            )
+        except Exception:
+            return fallback
+        try:
+            payload = response.json()
+            panel = payload.get("content", "") if isinstance(payload, dict) else ""
+        except Exception:
+            panel = response.text
+        same = [v for v in _parse_variants(panel) if v["kind"] == kind]
+        if not same:
+            return fallback
+        wanted = normalize_arch(request.arch)
+
+        def satisfies(variant: dict[str, str]) -> bool:
+            if wanted in (None, "", "universal", "noarch"):
+                return all(
+                    matches_abi(variant["abis"], abi) for abi in UNIVERSAL_ABIS
+                )
+            return matches_abi(variant["abis"], wanted)
+
+        # Keep the entry's own file when it already satisfies the request;
+        # otherwise take the first satisfying variant, else the first same-kind
+        # one. Never cross container kinds silently.
+        ranked = sorted(same, key=lambda v: (v["file_id"] != file_id, not satisfies(v)))
+        pick = ranked[0]
+        return (
+            pick["file_id"],
+            pick["kind"],
+            f"{app_url.rstrip('/')}/download/{pick['file_id']}-x",
         )
 
     def _find_app(
@@ -388,6 +494,30 @@ class UptodownProvider(Provider):
         value = os.getenv("APKD_UPTODOWN_BROWSER", "").strip().lower()
         return value in {"1", "true", "yes", "on", "headed"}
 
+    def _invisible_enabled(self) -> bool:
+        """Whether to drive the download page with invisible_playwright.
+
+        The stealth engine only presents a coherent browser fingerprint; it
+        is not a CAPTCHA solver, and the operator still completes any
+        interactive Turnstile manually. An explicit CDP endpoint always wins
+        because the invisible engine has no CDP surface.
+        """
+        if self.invisible is not None:
+            return self.invisible
+        value = os.getenv("APKD_UPTODOWN_INVISIBLE", "").strip().lower()
+        return value in {"1", "true", "yes", "on"}
+
+    def _invisible_seed(self) -> int | None:
+        if self.invisible_seed is not None:
+            return self.invisible_seed
+        raw = os.getenv("APKD_UPTODOWN_SEED", "").strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            return None
+
     def _browser_download_url(
         self, target: UptodownTarget
     ) -> tuple[str, list[dict[str, Any]], str | None, str, str | None]:
@@ -404,6 +534,14 @@ class UptodownProvider(Provider):
         timeout_ms = self._browser_timeout_ms()
         cdp_url = self._cdp_url()
         headless = self._headless_enabled()
+        use_invisible = self._invisible_enabled()
+        if use_invisible and cdp_url:
+            print(
+                "Uptodown browser download: a CDP endpoint is set, so the "
+                "operator's Chrome wins over invisible mode.",
+                file=sys.stderr,
+            )
+            use_invisible = False
         initial_wait_ms = int(self._initial_wait_seconds() * 1000)
         retry_wait_ms = int(self._retry_wait_seconds() * 1000)
         max_attempts = self._max_attempts()
@@ -413,6 +551,14 @@ class UptodownProvider(Provider):
             print(
                 "Uptodown browser download: connecting to the operator's Chrome "
                 "over CDP; complete the normal Turnstile in that browser.",
+                file=sys.stderr,
+            )
+        elif use_invisible:
+            seed = self._invisible_seed()
+            print(
+                "Uptodown browser download: invisible_playwright stealth engine "
+                f"(seed={seed if seed is not None else 'random'}); complete the "
+                "normal Turnstile in the browser window if one appears.",
                 file=sys.stderr,
             )
         elif headless:
@@ -435,15 +581,50 @@ class UptodownProvider(Provider):
         )
 
         try:
-            with sync_playwright() as playwright:
+            if use_invisible:
+                try:
+                    from invisible_playwright import InvisiblePlaywright
+                except ImportError as exc:
+                    raise ProviderError(
+                        "Uptodown invisible mode requires the "
+                        "invisible-playwright package; install it and fetch the "
+                        "engine (`python -m invisible_playwright fetch`)",
+                        provider=self.name,
+                    ) from exc
+                engine_cm = InvisiblePlaywright(
+                    seed=self._invisible_seed(), headless=headless
+                )
+            else:
+                engine_cm = sync_playwright()
+            with engine_cm as engine:
                 browser = None
                 context = None
                 page = None
                 owns_page = False
                 owns_browser = False
                 try:
-                    if cdp_url:
-                        browser = playwright.chromium.connect_over_cdp(
+                    if use_invisible:
+                        # The engine itself is the browser: a Playwright
+                        # Browser with a coherent stealth fingerprint. It is
+                        # not a CAPTCHA solver; an interactive Turnstile is
+                        # still completed by the operator.
+                        browser = engine
+                        owns_browser = True
+                        context = (
+                            browser.contexts[0]
+                            if browser.contexts
+                            else browser.new_context(locale="en-US")
+                        )
+                        page = context.new_page()
+                        downloads: list[Any] = []
+
+                        def on_download(download: Any) -> None:
+                            downloads.append(download)
+
+                        page.on("download", on_download)
+                        owns_page = True
+                    elif cdp_url:
+                        browser = engine.chromium.connect_over_cdp(
                             cdp_url, timeout=timeout_ms
                         )
                         if not browser.contexts:
@@ -467,7 +648,7 @@ class UptodownProvider(Provider):
                             launch_kwargs["channel"] = channel
                         if headless:
                             launch_kwargs["args"] = ["--no-sandbox"]
-                        browser = playwright.chromium.launch(**launch_kwargs)
+                        browser = engine.chromium.launch(**launch_kwargs)
                         owns_browser = True
                         context = browser.new_context(locale="en-US")
                         page = context.new_page()
@@ -606,7 +787,10 @@ class UptodownProvider(Provider):
                         except Exception:
                             pass
                     if owns_browser and browser is not None:
-                        browser.close()
+                        try:
+                            browser.close()
+                        except Exception:
+                            pass
         except ProviderError:
             raise
         except Exception as exc:
@@ -617,6 +801,12 @@ class UptodownProvider(Provider):
                 else " Check that the operator's Chrome is still running and "
                 "the CDP endpoint is reachable."
             )
+            if use_invisible:
+                cdp_hint += (
+                    " Invisible mode only presents a coherent fingerprint; a "
+                    "persistent interactive challenge still needs an operator, "
+                    "and another APKD_UPTODOWN_SEED sometimes passes."
+                )
             raise ProviderError(
                 "Uptodown browser download did not complete; solve the normal "
                 f"Turnstile challenge in the visible browser and retry "
