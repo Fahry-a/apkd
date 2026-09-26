@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "apkd"
+version = "0.2.0"
+description = "Provider-agnostic Android APK downloader"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+classifiers = [
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Topic :: Utilities",
+]
+# curl_cffi is bounded on both sides: the APKPure transport picks TLS
+# impersonation targets from the installed library's BrowserTypeLiteral, and a
+# release that renames or drops one must not change download behaviour silently.
+dependencies = [
+  "requests>=2.32,<3",
+  "beautifulsoup4>=4.12,<5",
+  "curl_cffi>=0.16,<0.17",
+]
+
+# Optional: only needed to pass Cloudflare's browser challenge (see
+# apkd/providers/_cloudflare.py). Kept out of the hard requirements so a plain
+# install stays light. Upper bounds matter here: _shadow_unlock patches
+# playwright-captcha by attribute name, so a breaking release fails at runtime
+# rather than at install time.
+[project.optional-dependencies]
+captcha = [
+  "playwright-captcha>=0.1.5,<0.2",
+  # playwright-captcha imports playwright.async_api at module level, so this is
+  # required even when patchright is the backend doing the actual driving.
+  "playwright>=1.49,<2",
+  "patchright>=1.63,<2",
+]
+
+[project.scripts]
+apkd = "apkd.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["apkd*"]
+
+# The vendored _apkpure/ tree records its upstream commit and re-sync recipe in
+# VENDORED.md. Ship it, or the drift record is lost from the sdist and wheel.
+[tool.setuptools.package-data]
+"apkd.providers._apkpure" = ["VENDORED.md"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

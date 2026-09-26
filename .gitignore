@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtualenvs / tooling
+.venv/
+venv/
+uv.lock
+
+# Caches / local state
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Downloads / artifacts produced while testing
+downloads/
+*.apk
+*.xapk
+*.apkm
+*.apks
